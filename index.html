@@ -1,0 +1,457 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width,initial-scale=1" />
+<title>Gesture Collector — WebGL + Three.js</title>
+<style>
+  html,body { margin:0; height:100%; overflow:hidden; font-family:Inter,system-ui,Arial; background:#0b1020; color:#e6eef8; }
+  #ui {
+    position: absolute; left: 12px; top: 12px; z-index: 20;
+    background: rgba(10,12,20,0.6); padding:10px; border-radius:10px; backdrop-filter: blur(6px);
+    width: 320px;
+  }
+  button { background:#1f6feb; border:none; color:white; padding:8px 10px; border-radius:6px; cursor:pointer; margin:4px 0; }
+  button.secondary { background:#2b2f3a; }
+  #score { font-size:18px; font-weight:600; }
+  #canvas-container { width:100vw; height:100vh; display:block; }
+  #small-preview { position:absolute; right:12px; top:12px; width:220px; height:140px; border-radius:8px; overflow:hidden; background:#000; z-index:20; opacity:0.95; }
+  #small-preview video { width:100%; height:100%; object-fit:cover; transform:scaleX(-1); }
+  .label { font-size:13px; color:#9fb4ff; margin-top:6px; }
+  .muted { color:#9aa3b2; font-size:12px; }
+  #gesture-name { font-size:20px; font-weight:700; color:#ffd780; }
+  #samples { max-height:140px; overflow:auto; margin-top:8px; font-size:13px; }
+  .sample-item { padding:6px; border-bottom:1px solid rgba(255,255,255,0.03); display:flex; justify-content:space-between; }
+  .danger { background:#b83232; }
+  .good { background:#25a04a; }
+</style>
+</head>
+<body>
+  <div id="ui">
+    <div id="score">Score: <span id="score-val">0</span></div>
+    <div class="label">Current Target:</div>
+    <div id="gesture-name">—</div>
+    <div class="label">Controls</div>
+    <button id="start-btn">Start Camera & Game</button>
+    <button id="toggle-auto" class="secondary">Auto-collect: ON</button>
+    <button id="record-manual" class="secondary">Record Sample Manually</button>
+    <div class="label">Samples</div>
+    <div id="samples"></div>
+    <div style="display:flex;gap:6px; margin-top:8px">
+      <button id="export-json">Download JSON</button>
+      <button id="clear-samples" class="secondary">Clear</button>
+    </div>
+    <div class="label muted">Privacy: samples stored locally. No uploads.</div>
+  </div>
+
+  <div id="small-preview" title="Camera preview (mirrored)">
+    <video id="video" autoplay playsinline muted></video>
+  </div>
+
+  <div id="canvas-container"></div>
+
+<script type="module">
+/*
+Gesture Collector Game
+- Three.js for rendering a simple avatar
+- TensorFlow MoveNet (via @tensorflow-models/pose-detection) for pose detection
+- Local-only sample storage + download
+Notes:
+- This uses CDN modules. Works best on modern browsers.
+- If camera permission is denied, the UI will show errors.
+*/
+
+import * as THREE from 'https://unpkg.com/three@0.150.1/build/three.module.js';
+import { OrbitControls } from 'https://unpkg.com/three@0.150.1/examples/jsm/controls/OrbitControls.js';
+import * as tf from 'https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.4.0/dist/tf.min.js';
+import * as posedetection from 'https://cdn.jsdelivr.net/npm/@tensorflow-models/pose-detection/dist/pose-detection.esm.js';
+
+// --- UI hooks
+const startBtn = document.getElementById('start-btn');
+const toggleAutoBtn = document.getElementById('toggle-auto');
+const recordBtn = document.getElementById('record-manual');
+const exportBtn = document.getElementById('export-json');
+const clearBtn = document.getElementById('clear-samples');
+const samplesDiv = document.getElementById('samples');
+const gestureNameEl = document.getElementById('gesture-name');
+const scoreVal = document.getElementById('score-val');
+
+const video = document.getElementById('video');
+let autoCollect = true;
+let score = 0;
+
+// --- Sample storage (local-only in-memory)
+let samples = []; // {label, keypoints, timestamp}
+
+// Utility: download JSON
+function downloadJSON(data, filename='gesture_samples.json'){
+  const blob = new Blob([JSON.stringify(data, null, 2)], {type:'application/json'});
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url; a.download = filename;
+  document.body.appendChild(a); a.click(); a.remove();
+  URL.revokeObjectURL(url);
+}
+
+// --- Game gestures (simple heuristics)
+// Each gesture returns true if the pose matches.
+function avgY(kp, name){ return kp.find(k=>k.name===name).y; }
+function avgX(kp, name){ return kp.find(k=>k.name===name).x; }
+
+function dist(a,b){ return Math.hypot(a.x-b.x, a.y-b.y); }
+
+// Convert moveNet keypoints to map of names (for easier use)
+function keypointsToMap(kps){
+  // moveNet uses names like 'left_shoulder'? the model returns keypoints with name?
+  // The pose-detection package includes keypoint names in keypoint.name
+  // Build a map from name-> {x,y,score}
+  const map = {};
+  for(const k of kps){
+    // some models use 'part' or 'name'
+    const n = k.name || k.part || k[2] || 'kp'+k.index;
+    map[n] = {x:k.x, y:k.y, score: k.score ?? k[2] ?? 0};
+  }
+  return map;
+}
+
+// Heuristic gestures
+const gestureRules = {
+  'hands_up': (kp) => {
+    // both wrists above shoulders
+    const leftW = kp['left_wrist'], rightW = kp['right_wrist'], leftS = kp['left_shoulder'], rightS = kp['right_shoulder'];
+    if (!leftW || !rightW || !leftS || !rightS) return false;
+    return leftW.y < leftS.y - 0.05 && rightW.y < rightS.y - 0.05;
+  },
+  't_pose': (kp) => {
+    // wrists roughly level with shoulders, far from body
+    const leftW = kp['left_wrist'], rightW = kp['right_wrist'], leftS = kp['left_shoulder'], rightS = kp['right_shoulder'];
+    const leftH = kp['left_hip'], rightH = kp['right_hip'];
+    if (!leftW||!rightW||!leftS||!rightS||!leftH||!rightH) return false;
+    const wristsLevel = Math.abs(leftW.y - leftS.y) < 0.12 && Math.abs(rightW.y - rightS.y) < 0.12;
+    const wide = dist(leftW,leftS) > 0.25 && dist(rightW,rightS) > 0.25;
+    return wristsLevel && wide;
+  },
+  'point_left': (kp) => {
+    // right arm near body, left arm extended to left
+    const leftW = kp['left_wrist'], leftE = kp['left_elbow'], leftS = kp['left_shoulder'];
+    if (!leftW||!leftE||!leftS) return false;
+    const elbowDir = leftE.x - leftS.x;
+    // extended left means leftW.x << leftS.x
+    return leftW.x < leftS.x - 0.12 && Math.abs(leftW.y - leftS.y) < 0.35;
+  },
+  'wave': (kp, lastHistory) => {
+    // detect left or right hand horizontal oscillation in last frames
+    if (!lastHistory || lastHistory.length < 6) return false;
+    // compute variance in x of wrists
+    const leftXs = lastHistory.map(h=>h['left_wrist']?.x ?? null).filter(x=>x!=null);
+    if (leftXs.length < 5) return false;
+    const range = Math.max(...leftXs) - Math.min(...leftXs);
+    return range > 0.12;
+  }
+};
+
+// Provide a friendly list of gesture labels and cycling order
+const gestureOrder = ['hands_up','t_pose','wave','point_left'];
+const gestureFriendly = {
+  'hands_up':'Hands Up',
+  't_pose':'T-pose',
+  'wave':'Wave (hand shake)',
+  'point_left':'Point Left'
+};
+
+// --- Three.js scene (avatar mirrors the pose)
+const container = document.getElementById('canvas-container');
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x071028);
+const camera = new THREE.PerspectiveCamera(50, window.innerWidth/window.innerHeight, 0.1, 1000);
+camera.position.set(0,1.6,3);
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(window.innerWidth, window.innerHeight);
+container.appendChild(renderer.domElement);
+
+const light = new THREE.DirectionalLight(0xffffff, 1);
+light.position.set(5,10,7);
+scene.add(light);
+scene.add(new THREE.AmbientLight(0x404060, 0.8));
+
+const controls = new OrbitControls(camera, renderer.domElement);
+controls.enablePan = false;
+controls.minDistance = 1.8;
+controls.maxDistance = 6;
+
+// Simple ground
+const ground = new THREE.Mesh(new THREE.PlaneGeometry(10,10), new THREE.MeshStandardMaterial({color:0x071026, metalness:0.1, roughness:0.9}));
+ground.rotation.x = -Math.PI/2;
+ground.position.y = -0.6;
+scene.add(ground);
+
+// Avatar: simple boxes for head/torso/limbs that will be positioned using pose keypoints
+const avatar = new THREE.Group();
+scene.add(avatar);
+
+function makeLimb(width, height, depth, color=0x89c2ff){
+  const g = new THREE.Mesh(new THREE.BoxGeometry(width,height,depth), new THREE.MeshStandardMaterial({color, roughness:0.6, metalness:0.1}));
+  return g;
+}
+const torso = makeLimb(0.4,0.6,0.25,0x407be3);
+torso.position.set(0,1.2,0);
+avatar.add(torso);
+const head = makeLimb(0.28,0.28,0.28,0xffd3a5); head.position.set(0,1.6,0); avatar.add(head);
+
+const leftArm = makeLimb(0.18,0.5,0.18,0x7fb1ff); leftArm.position.set(-0.45,1.25,0); avatar.add(leftArm);
+const rightArm = makeLimb(0.18,0.5,0.18,0x7fb1ff); rightArm.position.set(0.45,1.25,0); avatar.add(rightArm);
+
+const leftLeg = makeLimb(0.2,0.6,0.2,0x2f63b8); leftLeg.position.set(-0.15,0.6,0); avatar.add(leftLeg);
+const rightLeg = makeLimb(0.2,0.6,0.2,0x2f63b8); rightLeg.position.set(0.15,0.6,0); avatar.add(rightLeg);
+
+// particle group for success feedback
+const particles = new THREE.Group(); scene.add(particles);
+
+function spawnSuccessParticles(worldPos){
+  for(let i=0;i<18;i++){
+    const p = new THREE.Mesh(new THREE.SphereGeometry(0.02,6,6), new THREE.MeshStandardMaterial({color:0xffd27d}));
+    p.position.copy(worldPos);
+    const v = new THREE.Vector3((Math.random()-0.5)*1.6, Math.random()*1.2+0.2, (Math.random()-0.5)*1.6);
+    p.userData.velocity = v;
+    particles.add(p);
+  }
+}
+
+// --- Pose detection setup
+let detector = null;
+let modelReady = false;
+let running = false;
+let lastPose = null;
+let poseHistory = []; // store last N pose maps for history (for wave detection)
+const historyMax = 12;
+
+async function setupDetector(){
+  const model = posedetection.SupportedModels.MoveNet;
+  const detectorConfig = {modelType: posedetection.movenet.modelType.SINGLEPOSE_LIGHTNING};
+  detector = await posedetection.createDetector(model, detectorConfig);
+  modelReady = true;
+  console.log('Pose detector ready');
+}
+
+// --- Camera
+async function startCamera(){
+  try {
+    const stream = await navigator.mediaDevices.getUserMedia({video:{width:640, height:480, facingMode:'user'}, audio:false});
+    video.srcObject = stream;
+    await video.play();
+    console.log('Camera running', video.videoWidth, video.videoHeight);
+  } catch(e){
+    alert('Camera access required for gesture collection. Error: ' + e.message);
+    throw e;
+  }
+}
+
+// Helpers: normalize pose keypoints to relative coordinates in [-1..1] centered on mid-hips
+function normalizeKeypoints(kps){
+  // input: array of {x,y,score,name}
+  // Output: object map name-> {xNorm,yNorm,score}
+  const map = keypointsToMap(kps);
+  // compute center (mid hips / mid shoulders fallback)
+  const hipL = map['left_hip'], hipR = map['right_hip'];
+  const center = hipL && hipR ? {x:(hipL.x+hipR.x)/2, y:(hipL.y+hipR.y)/2} :
+                 (map['left_shoulder'] && map['right_shoulder'] ? {x:(map['left_shoulder'].x+map['right_shoulder'].x)/2, y:(map['left_shoulder'].y+map['right_shoulder'].y)/2} : {x:0.5,y:0.5});
+  // scale by torso length (shoulder to hip)
+  let refLen = 0.4;
+  if (map['left_shoulder'] && map['left_hip']) refLen = Math.abs(map['left_shoulder'].y - map['left_hip'].y);
+  const out = {};
+  for(const name in map){
+    out[name] = {x: (map[name].x - center.x) / refLen, y: (map[name].y - center.y) / refLen, score: map[name].score};
+  }
+  return out;
+}
+
+// Determine current gesture by checking rules
+function detectGesture(normMap){
+  for(const g of gestureOrder){
+    const rule = gestureRules[g];
+    try {
+      if (g === 'wave') {
+        if (rule(normMap, poseHistory)) return g;
+      } else {
+        if (rule(normMap)) return g;
+      }
+    } catch(e){ /* ignore */ }
+  }
+  return null;
+}
+
+// Add sample
+function addSample(label, rawKeypoints){
+  const s = {label, rawKeypoints, timestamp: Date.now()};
+  samples.push(s);
+  renderSampleList();
+}
+
+// render sample list
+function renderSampleList(){
+  samplesDiv.innerHTML = '';
+  for(let i=samples.length-1;i>=0;i--){
+    const it = samples[i];
+    const el = document.createElement('div'); el.className='sample-item';
+    const left = document.createElement('div');
+    left.innerText = `${gestureFriendly[it.label] || it.label}`;
+    const right = document.createElement('div'); right.innerHTML = `<span class="muted">${new Date(it.timestamp).toLocaleTimeString()}</span>`;
+    el.appendChild(left); el.appendChild(right);
+    samplesDiv.appendChild(el);
+  }
+}
+
+// --- Game loop and detection
+let targetIndex = 0;
+function cycleTarget(){
+  targetIndex = (targetIndex+1) % gestureOrder.length;
+  const g = gestureOrder[targetIndex];
+  gestureNameEl.innerText = gestureFriendly[g] ?? g;
+}
+function setTarget(index){
+  targetIndex = index % gestureOrder.length;
+  gestureNameEl.innerText = gestureFriendly[gestureOrder[targetIndex]] ?? '';
+}
+
+setTarget(0);
+
+// success when current detected === target
+async function frameLoop(){
+  if (!running) return;
+  // detect every ~2 frames (createDetector is fast but be mindful)
+  try {
+    const poses = await detector.estimatePoses(video, {maxPoses:1, flipHorizontal:true});
+    if (poses && poses.length>0){
+      lastPose = poses[0];
+      // build normalized map
+      const norm = normalizeKeypoints(lastPose.keypoints);
+      // keep history for wave detection
+      poseHistory.push(norm);
+      if (poseHistory.length > historyMax) poseHistory.shift();
+
+      // mirror avatar positions (map keypoints to world)
+      // Try to get shoulders/hips/wrists
+      const Ls = norm['left_shoulder'], Rs = norm['right_shoulder'], Lw = norm['left_wrist'], Rw = norm['right_wrist'], nose = norm['nose'];
+      if (Ls && Rs && nose){
+        // world mapping scale
+        const torsoWidth = Math.abs(Rs.x - Ls.x) || 0.2;
+        const scale = 0.9;
+        torso.scale.set(1, 1, 1);
+        torso.position.set(0, 1.2 + (nose.y*0.25), 0);
+        head.position.set(0, 1.6 + (nose.y*0.18), 0);
+        leftArm.position.set(-Math.min(0.7, Math.abs(Ls.x)*scale + 0.25), 1.2 + (Ls.y*0.25), 0);
+        rightArm.position.set(Math.min(0.7, Math.abs(Rs.x)*scale + 0.25), 1.2 + (Rs.y*0.25), 0);
+        leftLeg.position.set(-0.15 + (Ls.x*0.05), 0.6 + (Ls.y*0.05), 0);
+        rightLeg.position.set(0.15 + (Rs.x*0.05), 0.6 + (Rs.y*0.05), 0);
+      }
+
+      // detect gesture
+      const detected = detectGesture(norm);
+      if (detected) {
+        // show immediate visual feedback in UI
+        gestureNameEl.style.transform = 'scale(1.02)';
+        setTimeout(()=> gestureNameEl.style.transform = '', 120);
+      }
+
+      // if matches target
+      const target = gestureOrder[targetIndex];
+      if (detected === target){
+        // score + particle + optionally auto-collect sample
+        score += 10;
+        scoreVal.innerText = score;
+        // spawn particles at head location
+        const spawnPos = new THREE.Vector3(0,1.5,0);
+        spawnSuccessParticles(spawnPos);
+
+        // collect sample
+        if (autoCollect){
+          addSample(target, lastPose.keypoints);
+        }
+
+        // advance target
+        cycleTarget();
+      }
+    }
+  } catch(e){
+    console.warn('detect error', e);
+  }
+
+  // update particles physics
+  particles.children.forEach((p,i)=>{
+    p.position.addScaledVector(p.userData.velocity, 0.06);
+    p.userData.velocity.multiplyScalar(0.98);
+    p.material.opacity = Math.max(0, (1 - p.position.y*0.6));
+    if (p.position.y < -1) { particles.remove(p); }
+  });
+
+  renderer.render(scene, camera);
+  requestAnimationFrame(frameLoop);
+}
+
+// --- UI wiring
+startBtn.addEventListener('click', async ()=>{
+  if (!running){
+    startBtn.disabled = true;
+    startBtn.innerText = 'Starting…';
+    try {
+      await startCamera();
+      await setupDetector();
+      running = true;
+      startBtn.innerText = 'Running (click to stop)';
+      startBtn.disabled = false;
+      startBtn.onclick = stopGame;
+      requestAnimationFrame(frameLoop);
+    } catch(e){
+      startBtn.innerText = 'Start Camera & Game';
+      startBtn.disabled = false;
+      console.error(e);
+    }
+  }
+});
+
+function stopGame(){
+  running = false;
+  // stop camera
+  const s = video.srcObject;
+  if (s){ s.getTracks().forEach(t=>t.stop()); video.srcObject = null; }
+  startBtn.innerText = 'Start Camera & Game';
+  startBtn.onclick = null;
+  startBtn.addEventListener('click', async ()=>{ location.reload(); });
+}
+
+toggleAutoBtn.addEventListener('click', ()=>{
+  autoCollect = !autoCollect;
+  toggleAutoBtn.innerText = `Auto-collect: ${autoCollect ? 'ON' : 'OFF'}`;
+});
+
+recordBtn.addEventListener('click', ()=>{
+  if (!lastPose) { alert('No pose detected yet. Please allow camera and move into view.'); return; }
+  const target = gestureOrder[targetIndex];
+  addSample(target, lastPose.keypoints);
+});
+
+exportBtn.addEventListener('click', ()=>{
+  if (samples.length === 0) return alert('No samples yet.');
+  downloadJSON(samples, 'gesture_samples.json');
+});
+clearBtn.addEventListener('click', ()=>{
+  if (!confirm('Clear all locally stored samples?')) return;
+  samples = []; renderSampleList();
+});
+
+// responsive
+window.addEventListener('resize', ()=> {
+  camera.aspect = window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth, window.innerHeight);
+});
+
+// render loop for scene when idle (camera frames drive render but keep an animation)
+(function idle(){
+  requestAnimationFrame(idle);
+  renderer.render(scene, camera);
+})();
+
+</script>
+</body>
+</html>
